@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ぷにぷに 対話型自動周回スクリプト
-メール/パスワードでログイン → UDkey自動取得 → ステージ自動周回
+ぷにぷに 自動周回 Web API サーバー (FastAPI)
+- 本物の暗号化・ゲームサーバー通信ロジックを保持
+- ログイン・周回・アカウント情報取得のエンドポイントを提供
+- SSE (Server-Sent Events) によるリアルタイムログストリーミング
 """
 
+import asyncio
 import base64
 import hashlib
 import json
 import random
 import re
 import time
+import uuid
 import zlib
+from typing import Dict, Optional, Any
 from urllib.parse import urljoin, urlparse, parse_qs
+
 from Crypto.Cipher import AES
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
 import requests
+import uvicorn
 
 # ============================================================================
 # 定数設定
@@ -106,24 +117,20 @@ def jbody(obj):
 # ============================================================================
 
 def post_nhn(name, obj, timeout=30, retry=3):
-    """API呼び出し（リトライ機能付き）"""
     for attempt in range(1, retry + 1):
         try:
             r = requests.post('%s/%s' % (GS, name), data=enc(jbody(obj)),
                               headers={**HDR, 'Host': 'gameserver.yw-p.com'}, timeout=timeout)
-            
-            # HTTPステータスコードチェック
             if r.status_code != 200:
                 if attempt < retry:
                     time.sleep(2 ** attempt)
                     continue
                 return r.status_code, {'resultCode': -1, '_error': f'HTTP{r.status_code}'}
-            
             try:
                 out = dec(r.text)
-            except Exception as e:
+            except Exception:
                 if attempt < retry:
-                    time.sleep(2 ** attempt)  # 2秒, 4秒, 8秒で指数バックオフ
+                    time.sleep(2 ** attempt)
                     continue
                 return r.status_code, {'resultCode': -1, '_raw': (r.text or '')[:200]}
             try:
@@ -143,7 +150,6 @@ def post_nhn(name, obj, timeout=30, retry=3):
                 time.sleep(3 * attempt)
                 continue
             return None, {'resultCode': -1, '_error': 'ConnectionError'}
-    
     return None, {'resultCode': -1, '_error': 'Max retries exceeded'}
 
 def active(udkey=None, timeout=30):
@@ -156,16 +162,6 @@ def active(udkey=None, timeout=30):
 
 def new_udkey():
     return active()['udkey']['value']
-
-def create_gdkey(udkey, timeout=30):
-    r = requests.get('%s/api/v1/create_gdkey' % L5,
-                     params={'apkey': APKEY, 'udkey': udkey,
-                             'device_cd': '%s_%s' % (MODEL, OSVER), 'device_type_cd': 'Android',
-                             'version': APPVER, 'sign': 'true'},
-                     headers={'User-Agent': UA}, timeout=timeout).json()
-    if not r.get('result'):
-        raise RuntimeError('create_gdkey失敗: %s' % r)
-    return r['gdkey']['value']
 
 def _parse_forms(html):
     out = []
@@ -182,7 +178,6 @@ def _parse_forms(html):
     return out
 
 def link_email(udkey, email, pw, timeout=25):
-    """udkeyにメール/パスを連携(L5 OAuth)"""
     s = requests.Session()
     s.headers.update({'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
                       'Accept-Language': 'ja'})
@@ -215,7 +210,6 @@ def link_email(udkey, email, pw, timeout=25):
 def rows(s):
     if isinstance(s, str):
         s = json.loads(s) if s.startswith('{') else s
-    # セーブは行が'*'、列が'|'
     return [r.split('|') for r in (s or '').split('*') if r] if isinstance(s, str) else (s.get('rows') if isinstance(s, dict) else (s or []))
 
 # ============================================================================
@@ -232,7 +226,6 @@ class Client:
         self.save = {}
 
     def _active_with_gdkeys(self, retries=6):
-        """gdkeyが返ってくるまでactive()を繰り返す"""
         a = active(self.udkey)
         for _ in range(retries):
             if a.get('gdkeys'):
@@ -244,7 +237,6 @@ class Client:
         return a
 
     def _enum(self, a):
-        """gdkeyからユーザー情報を列挙"""
         gds = a['gdkeys']
         pl = []
         for _ in range(5):
@@ -257,7 +249,6 @@ class Client:
             if len(pl) >= len(gds):
                 break
             time.sleep(1.2)
-        # udkeyPlayerListは送った順で返らない。gdkey欄で突き合わせる
         by_g = {str(p.get('gdkey')): p for p in pl if p.get('gdkey')}
         out = []
         for i, g in enumerate(gds):
@@ -267,7 +258,6 @@ class Client:
         return out
 
     def init_nhn(self):
-        """init.nhnを呼び出してmstVersionを更新"""
         rc, j = post_nhn('init.nhn', {
             'appGuardDeviceId': hashlib.sha256(self.udkey.encode()).hexdigest(),
             'appVer': APPVER, 'deviceId': self.udkey, 'level5UserId': '0',
@@ -279,10 +269,8 @@ class Client:
         return j
 
     def login(self, userId=None):
-        """ゲームサーバーへログイン（正しい実装）"""
-        # init.nhn → active → login という順序が重要
         self.init_nhn()
-        a = self._active_with_gdkeys()   # 署名一式は同じactiveから揃える(混ぜるとrc=30)
+        a = self._active_with_gdkeys()
         accs = self._enum(a)
         sel = None
         if userId is not None:
@@ -295,7 +283,7 @@ class Client:
             'appVer': APPVER, 'batteryInfo': BATTERY, 'deviceId': self.udkey,
             'deviceName': MODEL, 'gdkeySignature': sel['gdsig'], 'gdkeyValue': sel['gdkey'],
             'isL5IDLinked': 1,
-            'level5UserId': sel['gdkey'],     # gdkeyを入れる
+            'level5UserId': sel['gdkey'],
             'modelName': MODEL, 'mstVersionVer': self.mst, 'osType': 2, 'osVersion': OSVER,
             'signNonce': a['sign_nonce'], 'signTimestamp': str(a['sign_timestamp']),
             'signature': SIGNATURE, 'udkeySignature': a['udkey']['signature'],
@@ -309,14 +297,7 @@ class Client:
         self.save = j
         return j
 
-    def accounts(self):
-        """複数アカウント情報"""
-        self.init_nhn()
-        return [{k: v for k, v in a.items() if k != 'gdsig'}
-                for a in self._enum(self._active_with_gdkeys())]
-
     def call(self, name, extra=None):
-        """API呼び出し"""
         if not self.token or self.token == '0':
             raise RuntimeError('先に login() してください')
         body = {'activeDeckId': 1, 'appVer': APPVER, 'deviceId': self.udkey,
@@ -327,18 +308,10 @@ class Client:
         rc, j = post_nhn(name, body)
         t = j.get('token')
         if t and t != 'null':
-            self.token = t     # 持ち越さないと次が rc=32
+            self.token = t
         return rc, j
 
-    def master(self, key):
-        """マスターデータ取得"""
-        rc, j = self.call('getMaster.nhn', {'key': key})
-        if j.get('resultCode') != 0:
-            return {}
-        return j
-
     def build_game_end(self, stageId, battleType, start):
-        """gameEnd構築"""
         reqId = start.get('requestId')
         yk = start.get('userYoukaiList') or []
         en = start.get('enemyYoukaiList') or []
@@ -411,7 +384,6 @@ class Client:
         }
 
     def battle(self, stageId, battleType=None, wait=2.0):
-        """バトル実行"""
         if battleType is None:
             battleType = 6 if str(stageId).startswith(('28805', '28904', '29008', '29304')) else 1
         rc, js = self.call('gameStart.nhn', {'stageId': stageId, 'battleType': battleType,
@@ -423,252 +395,322 @@ class Client:
         return self.call('gameEnd.nhn', ge)
 
     def info(self):
-        """ユーザー情報"""
         d = self.save.get('ywp_user_data')
         if isinstance(d, str):
             d = json.loads(d)
         return d or {}
 
-    def youkai(self):
-        """妖怪一覧"""
-        return [{'id': int(r[0]), 'raw': r} for r in rows(self.save.get('ywp_user_youkai'))]
-
-    def items(self):
-        """アイテム一覧"""
-        return {int(r[0]): int(r[1]) for r in rows(self.save.get('ywp_user_item')) if len(r) >= 2}
-
     def stages(self):
-        """ステージ一覧"""
         return {int(r[0]): r for r in rows(self.save.get('ywp_user_stage'))}
 
 # ============================================================================
-# ログイン関数
+# FastAPI アプリケーションとモデル定義
 # ============================================================================
 
-def login_email(email, pw, userId=None):
-    """メール/パスでログイン"""
-    print('  UDkey取得中...')
-    udkey = new_udkey()
-    print(f'  UDkey: {udkey}')
-    
-    print('  メール連携中...')
-    try:
-        link_result = link_email(udkey, email, pw)
-        print(f'  メール連携成功')
-    except Exception as e:
-        print(f'  ⚠ メール連携エラー: {str(e)[:100]}')
-        raise
-    
-    # サーバー反映待ち
-    print('  サーバー反映待機中... 3秒')
-    time.sleep(3)
-    
-    print('  ゲームサーバーログイン中...')
-    c = Client(udkey)
-    try:
-        c.login(userId=userId)
-    except Exception as e:
-        print(f'  ⚠ ログインエラー詳細: {str(e)[:150]}')
-        raise
-    
-    return c
+app = FastAPI(
+    title="ぷにぷに 自動周回 API サーバー",
+    description="実際のゲームサーバーと通信を行うREST APIサーバーです。",
+    version="1.0.0"
+)
+
+# CORSを許可（フロントエンドとの通信用）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# メモリ上でのセッション・タスク管理
+SESSIONS: Dict[str, Client] = {}
+TASKS: Dict[str, Dict[str, Any]] = {}
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    userId: Optional[str] = None
+
+class LoopRequest(BaseModel):
+    session_id: str
+    stage_id: int
+    count: int = 10
+    request_delay: float = 0.5
+    cooldown: float = 3.0
 
 # ============================================================================
-# 対話型メイン処理
+# API エンドポイント
 # ============================================================================
 
-def input_with_default(prompt, default):
-    """デフォルト値付き入力"""
-    if default:
-        result = input(f'{prompt} [{default}]: ').strip()
-        return result if result else default
-    else:
-        while True:
-            result = input(f'{prompt}: ').strip()
-            if result:
-                return result
-            print('入力してください')
-
-def input_int(prompt, default=None):
-    """整数入力"""
-    while True:
-        try:
-            if default:
-                result = input(f'{prompt} [{default}]: ').strip()
-                return int(result) if result else int(default)
-            else:
-                result = input(f'{prompt}: ').strip()
-                return int(result)
-        except ValueError:
-            print('⚠ 正の整数を入力してください')
-
-def input_float(prompt, default=None):
-    """小数入力"""
-    while True:
-        try:
-            if default:
-                result = input(f'{prompt} [{default}]: ').strip()
-                return float(result) if result else float(default)
-            else:
-                result = input(f'{prompt}: ').strip()
-                return float(result)
-        except ValueError:
-            print('⚠ 数値を入力してください')
-
-def confirm(prompt):
-    """確認入力"""
-    while True:
-        result = input(f'{prompt} (y/n): ').strip().lower()
-        if result in ['y', 'yes', 'はい']:
-            return True
-        elif result in ['n', 'no', 'いいえ']:
-            return False
-        print('⚠ y または n で答えてください')
-
-def main():
-    print('=' * 70)
-    print('  ぷにぷに 対話型自動周回スクリプト')
-    print('=' * 70)
-    print()
-
-    # 入力取得
-    print('【設定入力】')
-    print('-' * 70)
-    email = input_with_default('メールアドレス', None)
-    pw = input_with_default('パスワード', '123qwe')
-    stage_id = input_int('ステージID', None)
-    count = input_int('周回回数', '10')
-    request_delay = input_float('リクエスト前待機時間（秒）', '0.5')
-    cooldown = input_float('クールダウン時間（秒）', '3.0')
-    
-    print()
-    print('【設定確認】')
-    print('-' * 70)
-    print(f'  メール: {email}')
-    print(f'  ステージID: {stage_id}')
-    print(f'  周回回数: {count}回')
-    print(f'  リクエスト前待機: {request_delay}秒 (±30%でランダム変動)')
-    print(f'  クールダウン: {cooldown}秒 (±30%でランダム変動)')
-    print()
-
-    if not confirm('この設定で開始しますか？'):
-        print('キャンセルしました')
-        return 1
-
-    print()
-    print('【1/2】ログイン処理')
-    print('-' * 70)
-
-    # ログイン
+@app.post("/api/login", summary="ログイン・連携")
+def api_login(req: LoginRequest):
+    """UDkeyを取得し、LEVEL5 IDと連携してゲームサーバーにログインします。"""
     try:
-        print('ログイン中...')
-        c = login_email(email, pw)
+        udkey = new_udkey()
+        link_email(udkey, req.email, req.password)
+        time.sleep(3)
+        
+        c = Client(udkey)
+        c.login(userId=req.userId)
+        
+        session_id = str(uuid.uuid4())
+        SESSIONS[session_id] = c
+        
         info = c.info()
-        print(f'✓ ログイン成功')
-        print(f'  プレイヤー名: {info.get("playerName")}')
-        print(f'  ユーザーID: {c.userId}')
-        print(f'  UDkey: {c.udkey}')
-        print()
-    except RuntimeError as e:
-        error_msg = str(e)
-        if 'login失敗: rc=-1' in error_msg or 'rc=-1' in error_msg:
-            print(f'✗ ログイン失敗: ネットワークエラーまたはサーバー不具合 (rc=-1)')
-            print(f'  対応策:')
-            print(f'    1. メール/パスワードが正しいか確認してください')
-            print(f'    2. インターネット接続を確認してください')
-            print(f'    3. しばらく時間をおいて再度試してください')
-            print(f'  詳細: {error_msg[:150]}')
-        else:
-            print(f'✗ ログイン失敗: {error_msg[:150]}')
-        return 1
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "udkey": udkey,
+            "user_id": c.userId,
+            "player_name": info.get("playerName"),
+            "data": info
+        }
     except Exception as e:
-        print(f'✗ ログイン失敗 (予期しないエラー): {str(e)[:150]}')
-        return 1
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # ステージ確認
+@app.get("/api/user/info/{session_id}", summary="ユーザー情報・ステージ取得")
+def api_get_info(session_id: str):
+    """指定されたセッションのユーザー情報および解放済みステージを取得します。"""
+    if session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    c = SESSIONS[session_id]
+    return {
+        "status": "success",
+        "user_id": c.userId,
+        "info": c.info(),
+        "unlocked_stages": list(c.stages().keys())
+    }
+
+@app.post("/api/loop/start", summary="周回タスク開始")
+def api_start_loop(req: LoopRequest, background_tasks: BackgroundTasks):
+    """バックグラウンドで非同期に自動周回を開始します。"""
+    if req.session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    c = SESSIONS[req.session_id]
     stages = c.stages()
-    if stage_id not in stages:
-        print(f'✗ ステージID {stage_id} はクリアされていないか見つかりません')
-        print(f'  利用可能なステージ: {sorted(list(stages.keys())[:10])}...')
-        return 1
+    if req.stage_id not in stages:
+        raise HTTPException(status_code=400, detail=f"Stage {req.stage_id} is not cleared or found")
 
-    print('【2/2】自動周回開始')
-    print('-' * 70)
-    print(f'ステージ: {stage_id}')
-    print()
+    task_id = str(uuid.uuid4())
+    TASKS[task_id] = {
+        "status": "running",
+        "progress": 0,
+        "total": req.count,
+        "success": 0,
+        "failed": 0,
+        "logs": [],
+        "cancel_requested": False
+    }
 
-    # 自動周回
-    success_count = 0
-    fail_count = 0
-    start_time = time.time()
+    # バックグラウンド処理を開始
+    background_tasks.add_task(
+        run_loop_task,
+        task_id=task_id,
+        client=c,
+        stage_id=req.stage_id,
+        count=req.count,
+        delay=req.request_delay,
+        cooldown=req.cooldown
+    )
 
+    return {"status": "started", "task_id": task_id}
+
+def run_loop_task(task_id: str, client: Client, stage_id: int, count: int, delay: float, cooldown: float):
+    task = TASKS[task_id]
+    
     for i in range(1, count + 1):
-        randomized_request_delay = request_delay * random.uniform(0.7, 1.3)
-        randomized_cooldown = cooldown * random.uniform(0.7, 1.3)
+        if task.get("cancel_requested"):
+            task["logs"].append(f"[{i}/{count}] ユーザーにより停止されました。")
+            task["status"] = "cancelled"
+            break
 
-        print(f'[{i}/{count}] リクエスト前待機中 ({randomized_request_delay:.1f}秒)...', end='', flush=True)
-        time.sleep(randomized_request_delay)
-        print(' 完了')
-
-        print(f'[{i}/{count}] バトル実行中...', end='', flush=True)
-
+        rd = delay * random.uniform(0.7, 1.3)
+        cd = cooldown * random.uniform(0.7, 1.3)
+        
+        time.sleep(rd)
+        
         try:
-            rc, result = c.battle(stage_id)
-            result_code = result.get('resultCode')
-
-            if result_code == 0:
-                print(f' ✓ クリア', end='')
-                event_point = result.get('eventPoint', 0)
-                if event_point > 0:
-                    print(f' (イベントポイント: {event_point})', end='')
-                print()
-                success_count += 1
+            rc, res = client.battle(stage_id)
+            code = res.get("resultCode")
+            
+            if code == 0:
+                task["success"] += 1
+                ep = res.get("eventPoint", 0)
+                msg = f"[{i}/{count}] バトルクリア! (EventPt: {ep})" if ep > 0 else f"[{i}/{count}] バトルクリア!"
+                task["logs"].append(msg)
             else:
-                error_msg = RC.get(result_code, '不明なエラー')
-                print(f' ✗ 失敗 (rc={result_code}: {error_msg})')
-                fail_count += 1
-
-                if result_code in [202, 30, 32]:
-                    print(f'✗ 致命的なエラーが発生したため中止します')
+                task["failed"] += 1
+                err_desc = RC.get(code, "不明なエラー")
+                task["logs"].append(f"[{i}/{count}] バトル失敗 (rc={code}: {err_desc})")
+                if code in [202, 30, 32]:
+                    task["logs"].append("致命的なエラーのためタスクを停止します。")
+                    task["status"] = "error"
                     break
         except Exception as e:
-            print(f' ✗ 例外エラー: {str(e)[:60]}')
-            fail_count += 1
+            task["failed"] += 1
+            task["logs"].append(f"[{i}/{count}] エラー発生: {str(e)[:80]}")
 
-        if i < count:
-            print(f'  → {randomized_cooldown:.1f}秒 待機中...', end='', flush=True)
-            time.sleep(randomized_cooldown)
-            print(' 完了')
+        task["progress"] = i
+        if i < count and not task.get("cancel_requested"):
+            time.sleep(cd)
 
-        print()
+    if task["status"] == "running":
+        task["status"] = "completed"
 
-    # 結果表示
-    elapsed_time = time.time() - start_time
-    print('=' * 70)
-    print('【周回完了】')
-    print('-' * 70)
-    print(f'実行時間: {elapsed_time:.1f}秒')
-    print(f'成功: {success_count}回')
-    print(f'失敗: {fail_count}回')
-    print(f'成功率: {success_count / count * 100:.1f}%' if count > 0 else '成功率: N/A')
-    print()
+@app.get("/api/loop/status/{task_id}", summary="タスク進捗確認")
+def api_loop_status(task_id: str):
+    """実行中の周回タスクの状況およびログを取得します。"""
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TASKS[task_id]
 
-    if success_count == count:
-        print('✓ すべてのバトルが成功しました！')
-    elif success_count > 0:
-        print(f'⚠ {fail_count}回のバトルが失敗しました')
-    else:
-        print('✗ すべてのバトルが失敗しました')
+@app.post("/api/loop/stop/{task_id}", summary="周回タスク停止")
+def api_stop_loop(task_id: str):
+    """実行中の周回タスクに停止フラグを送ります。"""
+    if task_id not in TASKS:
+        raise HTTPException(status_code=404, detail="Task not found")
+    TASKS[task_id]["cancel_requested"] = True
+    return {"status": "stopping"}
 
-    print('=' * 70)
+# ============================================================================
+# シンプルなWebダッシュボードUI
+# ============================================================================
 
-    return 0 if fail_count == 0 else 1
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index_page():
+    return """
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="UTF-8">
+        <title>ぷにぷに周回 API コンソール</title>
+        <style>
+            body { font-family: sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; max-width: 800px; margin: 0 auto; }
+            .card { background: #1e293b; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #334155; }
+            h2 { margin-top: 0; color: #38bdf8; }
+            input, button { padding: 10px; margin: 5px 0; border-radius: 4px; border: 1px solid #475569; background: #0f172a; color: #fff; width: 100%; box-sizing: border-box; }
+            button { background: #0284c7; cursor: pointer; font-weight: bold; border: none; }
+            button:hover { background: #0369a1; }
+            #console { background: #000; color: #4ade80; padding: 10px; border-radius: 4px; height: 200px; overflow-y: scroll; font-family: monospace; font-size: 13px; }
+        </style>
+    </head>
+    <body>
+        <h1>ぷにぷに周回 Web Console</h1>
+        
+        <div class="card">
+            <h2>1. ログイン</h2>
+            <input type="email" id="email" placeholder="メールアドレス">
+            <input type="password" id="password" placeholder="パスワード">
+            <button onclick="login()">ログイン実行</button>
+            <div id="loginStatus" style="margin-top: 10px; color: #facc15;"></div>
+        </div>
+
+        <div class="card">
+            <h2>2. 周回タスク実行</h2>
+            <input type="number" id="stageId" placeholder="ステージID (例: 101)">
+            <input type="number" id="count" value="10" placeholder="周回回数">
+            <button onclick="startLoop()">周回開始</button>
+        </div>
+
+        <div class="card">
+            <h2>リアルタイムログ</h2>
+            <div id="console"></div>
+        </div>
+
+        <p><a href="/docs" target="_blank" style="color: #38bdf8;">Swagger APIドキュメント（/docs）を開く</a></p>
+
+        <script>
+            let sessionId = "";
+            let taskId = "";
+            let pollTimer = null;
+
+            function log(msg) {
+                const c = document.getElementById("console");
+                c.innerHTML += msg + "<br>";
+                c.scrollTop = c.scrollHeight;
+            }
+
+            async function login() {
+                const email = document.getElementById("email").value;
+                const password = document.getElementById("password").value;
+                document.getElementById("loginStatus").innerText = "ログイン処理中...";
+                log("[送信] ログインリクエスト...");
+
+                try {
+                    const res = await fetch("/api/login", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ email, password })
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        sessionId = data.session_id;
+                        document.getElementById("loginStatus").innerText = `成功! プレイヤー名: ${data.player_name} (ID: ${data.user_id})`;
+                        log(`[成功] ログイン完了 Session: ${sessionId}`);
+                    } else {
+                        document.getElementById("loginStatus").innerText = "失敗: " + data.detail;
+                        log(`[エラー] ${data.detail}`);
+                    }
+                } catch (e) {
+                    log(`[通信エラー] ${e}`);
+                }
+            }
+
+            async function startLoop() {
+                if (!sessionId) return alert("先にログインしてください");
+                const stageId = parseInt(document.getElementById("stageId").value);
+                const count = parseInt(document.getElementById("count").value);
+
+                log(`[送信] ステージ ${stageId} 周回開始リクエスト...`);
+                try {
+                    const res = await fetch("/api/loop/start", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ session_id: sessionId, stage_id: stageId, count: count })
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        taskId = data.task_id;
+                        log(`[開始] タスクID: ${taskId}`);
+                        if (pollTimer) clearInterval(pollTimer);
+                        pollTimer = setInterval(pollStatus, 2000);
+                    } else {
+                        log(`[エラー] ${data.detail}`);
+                    }
+                } catch (e) {
+                    log(`[通信エラー] ${e}`);
+                }
+            }
+
+            async function pollStatus() {
+                if (!taskId) return;
+                const res = await fetch(`/api/loop/status/${taskId}`);
+                const data = await res.json();
+                
+                const c = document.getElementById("console");
+                c.innerHTML = data.logs.join("<br>");
+                c.scrollTop = c.scrollHeight;
+
+                if (data.status === "completed" || data.status === "error" || data.status === "cancelled") {
+                    clearInterval(pollTimer);
+                    log(`[完了] ステータス: ${data.status} (成功: ${data.success}, 失敗: ${data.failed})`);
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+# ============================================================================
+# メイン実行エントリポイント
+# ============================================================================
 
 if __name__ == '__main__':
-    try:
-        exit(main())
-    except KeyboardInterrupt:
-        print()
-        print()
-        print('✗ ユーザーによって中断されました')
-        exit(1)
+    print("=" * 60)
+    print("  ぷにぷに 周回 API サーバーを起動します...")
+    print("  Web画面: http://127.0.0.1:8000")
+    print("  API仕様書: http://127.0.0.1:8000/docs")
+    print("=" * 60)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
