@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ぷにぷに 自動周回 Web API サーバー (FastAPI)
-- 本物の暗号化・ゲームサーバー通信ロジックを保持
-- ログイン・周回・アカウント情報取得のエンドポイントを提供
-- SSE (Server-Sent Events) によるリアルタイムログストリーミング
+ぷにぷに 自動周回 Web API サーバー (FastAPI) - 非同期改善版
 """
 
 import asyncio
@@ -21,9 +18,9 @@ from urllib.parse import urljoin, urlparse, parse_qs
 
 from Crypto.Cipher import AES
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 import requests
 import uvicorn
 
@@ -383,6 +380,11 @@ class Client:
             'ywp_mst_game_const': GAME_CONST,
         }
 
+    async def async_battle(self, stageId, battleType=None, wait=2.0):
+        """スレッドプールで同期処理を実行し非同期ループを阻害しないように変更"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.battle, stageId, battleType, wait)
+
     def battle(self, stageId, battleType=None, wait=2.0):
         if battleType is None:
             battleType = 6 if str(stageId).startswith(('28805', '28904', '29008', '29304')) else 1
@@ -410,10 +412,9 @@ class Client:
 app = FastAPI(
     title="ぷにぷに 自動周回 API サーバー",
     description="実際のゲームサーバーと通信を行うREST APIサーバーです。",
-    version="1.0.0"
+    version="1.0.1"
 )
 
-# CORSを許可（フロントエンドとの通信用）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -422,7 +423,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# メモリ上でのセッション・タスク管理
 SESSIONS: Dict[str, Client] = {}
 TASKS: Dict[str, Dict[str, Any]] = {}
 
@@ -443,15 +443,15 @@ class LoopRequest(BaseModel):
 # ============================================================================
 
 @app.post("/api/login", summary="ログイン・連携")
-def api_login(req: LoginRequest):
-    """UDkeyを取得し、LEVEL5 IDと連携してゲームサーバーにログインします。"""
+async def api_login(req: LoginRequest):
+    loop = asyncio.get_event_loop()
     try:
-        udkey = new_udkey()
-        link_email(udkey, req.email, req.password)
-        time.sleep(3)
+        udkey = await loop.run_in_executor(None, new_udkey)
+        await loop.run_in_executor(None, link_email, udkey, req.email, req.password)
+        await asyncio.sleep(3)
         
         c = Client(udkey)
-        c.login(userId=req.userId)
+        await loop.run_in_executor(None, c.login, req.userId)
         
         session_id = str(uuid.uuid4())
         SESSIONS[session_id] = c
@@ -470,7 +470,6 @@ def api_login(req: LoginRequest):
 
 @app.get("/api/user/info/{session_id}", summary="ユーザー情報・ステージ取得")
 def api_get_info(session_id: str):
-    """指定されたセッションのユーザー情報および解放済みステージを取得します。"""
     if session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -484,7 +483,6 @@ def api_get_info(session_id: str):
 
 @app.post("/api/loop/start", summary="周回タスク開始")
 def api_start_loop(req: LoopRequest, background_tasks: BackgroundTasks):
-    """バックグラウンドで非同期に自動周回を開始します。"""
     if req.session_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -504,9 +502,8 @@ def api_start_loop(req: LoopRequest, background_tasks: BackgroundTasks):
         "cancel_requested": False
     }
 
-    # バックグラウンド処理を開始
     background_tasks.add_task(
-        run_loop_task,
+        run_async_loop_task,
         task_id=task_id,
         client=c,
         stage_id=req.stage_id,
@@ -517,7 +514,7 @@ def api_start_loop(req: LoopRequest, background_tasks: BackgroundTasks):
 
     return {"status": "started", "task_id": task_id}
 
-def run_loop_task(task_id: str, client: Client, stage_id: int, count: int, delay: float, cooldown: float):
+async def run_async_loop_task(task_id: str, client: Client, stage_id: int, count: int, delay: float, cooldown: float):
     task = TASKS[task_id]
     
     for i in range(1, count + 1):
@@ -529,10 +526,10 @@ def run_loop_task(task_id: str, client: Client, stage_id: int, count: int, delay
         rd = delay * random.uniform(0.7, 1.3)
         cd = cooldown * random.uniform(0.7, 1.3)
         
-        time.sleep(rd)
+        await asyncio.sleep(rd)
         
         try:
-            rc, res = client.battle(stage_id)
+            rc, res = await client.async_battle(stage_id)
             code = res.get("resultCode")
             
             if code == 0:
@@ -552,30 +549,32 @@ def run_loop_task(task_id: str, client: Client, stage_id: int, count: int, delay
             task["failed"] += 1
             task["logs"].append(f"[{i}/{count}] エラー発生: {str(e)[:80]}")
 
+        # ログサイズの無制限増加を抑止（最新100件まで保持）
+        if len(task["logs"]) > 100:
+            task["logs"] = task["logs"][-100:]
+
         task["progress"] = i
         if i < count and not task.get("cancel_requested"):
-            time.sleep(cd)
+            await asyncio.sleep(cd)
 
     if task["status"] == "running":
         task["status"] = "completed"
 
 @app.get("/api/loop/status/{task_id}", summary="タスク進捗確認")
 def api_loop_status(task_id: str):
-    """実行中の周回タスクの状況およびログを取得します。"""
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="Task not found")
     return TASKS[task_id]
 
 @app.post("/api/loop/stop/{task_id}", summary="周回タスク停止")
 def api_stop_loop(task_id: str):
-    """実行中の周回タスクに停止フラグを送ります。"""
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="Task not found")
     TASKS[task_id]["cancel_requested"] = True
     return {"status": "stopping"}
 
 # ============================================================================
-# シンプルなWebダッシュボードUI
+# ダッシュボード UI (変更なし)
 # ============================================================================
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -702,10 +701,6 @@ def index_page():
     </body>
     </html>
     """
-
-# ============================================================================
-# メイン実行エントリポイント
-# ============================================================================
 
 if __name__ == '__main__':
     print("=" * 60)
